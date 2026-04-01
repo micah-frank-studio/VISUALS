@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HydraReactive</title>
+<script src="https://unpkg.com/hydra-synth"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: monospace; color: #aaa; }
+  canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; }
+
+  #controls {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 1000; pointer-events: none;
+    opacity: 0; transition: opacity 0.3s;
+  }
+  #controls.visible { opacity: 1; }
+
+  #patch-name {
+    position: absolute; top: 16px; left: 16px;
+    font-size: 14px; letter-spacing: 2px; text-transform: uppercase;
+  }
+  #source-indicator {
+    position: absolute; top: 16px; right: 16px;
+    font-size: 12px; letter-spacing: 1px;
+  }
+  #shortcuts {
+    position: absolute; bottom: 40px; left: 16px;
+    font-size: 11px; line-height: 1.8; opacity: 0.6;
+  }
+  #meter-wrap {
+    position: absolute; bottom: 0; left: 0; width: 100%; height: 3px;
+    background: rgba(255,255,255,0.05);
+  }
+  #meter {
+    height: 100%; width: 0; background: rgba(255,255,255,0.3);
+    transition: width 0.05s linear;
+  }
+  #file-input { display: none; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <div id="patch-name">PATCH 1: GRID STUTTER</div>
+  <div id="source-indicator">MIC</div>
+  <div id="shortcuts">
+    [1] Grid Stutter &nbsp; [2] Recursive Stencil &nbsp; [3] Frequency Shimmer<br>
+    [M] Toggle Mic/File &nbsp; [Tab] Show/Hide
+  </div>
+  <div id="meter-wrap"><div id="meter"></div></div>
+</div>
+<input type="file" id="file-input" accept="audio/*">
+
+<script>
+// ============================================================
+// AUDIO ENGINE
+// ============================================================
+class AudioEngine {
+  constructor() {
+    this.ctx = null;
+    this.analyser = null;
+    this.source = null;
+    this.fftData = null;
+    this.waveData = null;
+
+    this.bands = { bass: 0, mid: 0, high: 0 };
+    this.smoothedBands = { bass: 0, mid: 0, high: 0 };
+    this.energy = 0;
+    this.smoothedEnergy = 0;
+    this.prevEnergy = 0;
+    this.transientDecay = 0;
+    this.transient = false;
+    this.silenceFrames = 0;
+    this.silenceFactor = 0;
+    this.active = false;
+  }
+
+  async init() {
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.analyser.smoothingTimeConstant = 0.3;
+    this.analyser.minDecibels = -100;
+    this.analyser.maxDecibels = -10;
+    this.fftData = new Float32Array(this.analyser.frequencyBinCount);
+    this.waveData = new Float32Array(this.analyser.fftSize);
+  }
+
+  async connectMic() {
+    if (!this.ctx) await this.init();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    if (this.source) { this.source.disconnect(); this.source = null; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.source = this.ctx.createMediaStreamSource(stream);
+      this.source.connect(this.analyser);
+      this.active = true;
+    } catch (e) {
+      console.warn('Mic access denied:', e);
+    }
+  }
+
+  async connectFile(audioElement) {
+    if (!this.ctx) await this.init();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    if (this.source) { this.source.disconnect(); this.source = null; }
+    this.source = this.ctx.createMediaElementSource(audioElement);
+    this.source.connect(this.analyser);
+    this.analyser.connect(this.ctx.destination);
+    this.active = true;
+  }
+
+  update() {
+    if (!this.active || !this.analyser) return;
+
+    this.analyser.getFloatFrequencyData(this.fftData);
+    this.analyser.getFloatTimeDomainData(this.waveData);
+
+    // Band extraction (1024 bins at 44.1kHz, ~21.5Hz per bin)
+    const extract = (lo, hi) => {
+      let sum = 0, count = 0;
+      for (let i = lo; i <= hi && i < this.fftData.length; i++) {
+        sum += Math.max(0, (this.fftData[i] + 100) / 90);
+        count++;
+      }
+      return count > 0 ? Math.pow(sum / count, 0.6) : 0; // gamma lift
+    };
+
+    this.bands.bass = extract(0, 9);       // 0-200Hz
+    this.bands.mid  = extract(10, 93);      // 200Hz-2kHz
+    this.bands.high = extract(94, 465);     // 2kHz-10kHz
+
+    // RMS energy from waveform
+    let sumSq = 0;
+    for (let i = 0; i < this.waveData.length; i++) sumSq += this.waveData[i] ** 2;
+    this.energy = Math.sqrt(sumSq / this.waveData.length);
+
+    // Smoothing (ambient-tuned)
+    const S = 0.06;
+    this.smoothedBands.bass += (this.bands.bass - this.smoothedBands.bass) * S;
+    this.smoothedBands.mid  += (this.bands.mid  - this.smoothedBands.mid)  * S;
+    this.smoothedBands.high += (this.bands.high - this.smoothedBands.high) * S;
+    this.smoothedEnergy += (this.energy - this.smoothedEnergy) * S;
+
+    // Transient detection
+    const delta = this.smoothedEnergy - this.prevEnergy;
+    if (delta > 0.02) this.transientDecay = 1.0;
+    this.transientDecay *= 0.92;
+    if (this.transientDecay < 0.01) this.transientDecay = 0;
+    this.transient = this.transientDecay > 0.5;
+    this.prevEnergy = this.smoothedEnergy;
+
+    // Silence detection
+    if (this.smoothedEnergy < 0.005) {
+      this.silenceFrames = Math.min(300, this.silenceFrames + 1);
+    } else {
+      this.silenceFrames = Math.max(0, this.silenceFrames - 2);
+    }
+    this.silenceFactor = Math.min(1, this.silenceFrames / 120);
+  }
+}
+
+// ============================================================
+// VISUAL STATE
+// ============================================================
+const v = {
+  repeatX: 4, repeatY: 4,
+  shapeSize: 0.3, scale1: 1,
+  scrollSpeed: 0.01, scrollDist: 0.2,
+  modulateAmount: 10,
+  blend0: 0.5, blend1: 0.5, blend2: 0.5,
+  inv: 0, brightness: 0,
+  noiseFreq: 3, hipevar: 4,
+  dimFactor: 1,
+};
+
+// ============================================================
+// AUDIO MAPPER
+// ============================================================
+class AudioMapper {
+  constructor(audioEngine) {
+    this.audio = audioEngine;
+    this.invToggle = 0;
+    this.lastTransient = false;
+  }
+
+  update(patchNum) {
+    const a = this.audio;
+    const bass = a.smoothedBands.bass;
+    const mid  = a.smoothedBands.mid;
+    const high = a.smoothedBands.high;
+    const energy = a.smoothedEnergy;
+    const td = a.transientDecay;
+    const sf = a.silenceFactor;
+
+    // Transient toggle (fires once per transient)
+    if (a.transient && !this.lastTransient) {
+      this.invToggle = this.invToggle === 1 ? 0 : 1;
+    }
+    this.lastTransient = a.transient;
+    v.inv = this.invToggle * td;
+
+    // Silence dimming (never fully black)
+    v.dimFactor = 1 - sf * 0.8;
+
+    // Shared mappings (additive — base + band * amount)
+    v.brightness = high * 0.3;
+
+    if (patchNum === 1) {
+      // Grid Stutter: energy drives repeat density
+      v.repeatX = 4 + energy * 30;
+      v.repeatY = 4 + energy * 30;
+      v.shapeSize = 0.3 + bass * 0.4;
+      v.scale1 = 1 + bass * 2;
+      v.scrollSpeed = 0.01 + mid * 2;
+      v.scrollDist = 0.2 + mid * 3;
+      v.modulateAmount = 2 + energy * 30;
+      v.blend0 = 0.2 + energy * 0.6;
+      v.blend1 = 0.2 + energy * 0.6;
+    } else if (patchNum === 2) {
+      // Recursive Stencil: energy drives noise density
+      v.noiseFreq = 100 + energy * 1500;
+      v.repeatX = 4 + energy * 10;
+      v.repeatY = 10 + energy * 40;
+      v.hipevar = 4 + mid * 30;
+      v.scrollSpeed = 0.1 + mid * 2;
+      v.scrollDist = 0.5 + mid * 2;
+      v.blend0 = 0.2 + bass * 0.6;
+      v.blend1 = 0.1 + high * 0.5;
+      v.blend2 = 0.3 + energy * 0.5;
+      v.scale1 = 1 + bass * 1.5;
+    } else if (patchNum === 3) {
+      // Frequency Shimmer: all bands active
+      v.repeatX = 4 + energy * 15;
+      v.repeatY = 4 + energy * 15;
+      v.modulateAmount = 2 + bass * 20 + mid * 15 + high * 10;
+      v.scrollSpeed = 0.01 + mid * 0.5;
+      v.scrollDist = 0.2 + bass * 2;
+      v.noiseFreq = 3 + mid * 15;
+      v.blend0 = 0.2 + energy * 0.5;
+      v.blend1 = 0.2 + energy * 0.5;
+      v.blend2 = 0.2 + energy * 0.5;
+      v.scale1 = 1 + bass * 2;
+    }
+  }
+}
+
+// ============================================================
+// PATCH 1: GRID STUTTER
+// Based on etude3/etude4.1 — shape(4) grids, heavy repeat, modulateScale
+// ============================================================
+function buildPatch1() {
+  solid().out(o0); solid().out(o1); solid().out(o2); solid().out(o3);
+
+  // o0: Primary reactive grid
+  shape(4, () => v.shapeSize, 0)
+    .repeatX(() => v.repeatX)
+    .repeatY(() => v.repeatY)
+    .modulateScale(osc(() => v.modulateAmount * 0.1))
+    .modulateRepeatY(osc(0.1))
+    .invert(() => v.inv)
+    .out(o0);
+
+  // o1: Secondary grid — dense, scrolling
+  shape(4, 0.6, 0)
+    .repeatX(3)
+    .repeatY(40)
+    .modulateScale(osc(80, 15, 0))
+    .scrollY(() => v.scrollSpeed * 10, () => v.scrollDist)
+    .out(o1);
+
+  // o2: Modulation source — time-animated
+  shape(4, 0.2, 0)
+    .modulateScrollX(osc(2, 2), ({time}) => Math.sin(time) * 3, 2)
+    .scale(() => v.scale1, 1, 1)
+    .out(o2);
+
+  // o3: Composite with reactive blending + mask
+  shape(4, 0.3, 0)
+    .modulateRepeatX(shape(), ({time}) => Math.sin(time), 100)
+    .modulateRepeatY(osc(1), 10, () => v.modulateAmount)
+    .scale(() => v.scrollSpeed, 0.5, () => v.shapeSize)
+    .scale(() => v.scale1)
+    .invert(() => v.inv)
+    .mask(src(o2))
+    .blend(src(o0), () => v.blend0 * v.dimFactor)
+    .blend(src(o1), () => v.blend1 * v.dimFactor * 0.5)
+    .brightness(() => (v.dimFactor - 1) * 0.3 + v.brightness)
+    .out(o3);
+
+  render(o3);
+}
+
+// ============================================================
+// PATCH 2: RECURSIVE STENCIL
+// Based on 526_2/10-19-20 — triple mask, noise source, cross-buffer
+// ============================================================
+function buildPatch2() {
+  solid().out(o0); solid().out(o1); solid().out(o2); solid().out(o3);
+
+  // o0: Noise field masked through stencil chain
+  noise(() => v.noiseFreq, 100)
+    .mask(
+      shape(2, 0.9)
+        .modulateRepeatY(shape(2), 3, 100)
+        .repeatY(2)
+    )
+    .invert(() => v.inv)
+    .scrollY(() => v.scrollSpeed, () => v.scrollDist * 0.5)
+    .mask(shape(4, 0.5).modulateScale(osc(0.8, 1)).repeat(4))
+    .mask(shape(2).modulateScale(noise(3)))
+    .modulateScale(osc(0.2, 2))
+    .out(o0);
+
+  // o1: Circular stencil with organic masking
+  shape(90)
+    .scrollY(0.1, 0.2)
+    .mask(shape(2).modulateScale(noise(3)))
+    .scrollX(1, 0.01)
+    .invert(1)
+    .mask(shape(4, 0.5).repeat(() => v.hipevar))
+    .modulateScale(osc(0.9, 0.1))
+    .scrollX(0.9, 0.2)
+    .out(o1);
+
+  // o2: Cross-buffer masking — masks o1, geometric frame
+  shape(2, 0.4)
+    .repeatY(() => v.repeatY)
+    .mask(src(o1))
+    .scale(() => v.scale1)
+    .mask(shape(2).modulateScale(noise(0.1, 0.07)))
+    .repeatY(2)
+    .mask(shape(4, 1).modulateScale(osc(1, 0.9)))
+    .blend(src(o0), 0.2)
+    .out(o2);
+
+  // o3: Blend composite with reactive opacities
+  shape(4, 0.2, 0)
+    .blend(src(o1), () => v.blend0 * v.dimFactor)
+    .blend(src(o2), () => v.blend2 * v.dimFactor)
+    .blend(src(o1), () => v.blend1 * v.dimFactor)
+    .brightness(() => (v.dimFactor - 1) * 0.3 + v.brightness)
+    .out(o3);
+
+  render(o3);
+}
+
+// ============================================================
+// PATCH 3: FREQUENCY SHIMMER
+// Based on etude9/etude10 — frequency-driven, phase-locked blending
+// ============================================================
+function buildPatch3() {
+  solid().out(o0); solid().out(o1); solid().out(o2); solid().out(o3);
+
+  // o0: Frequency-responsive base geometry
+  shape(2, 0.03, 0)
+    .modulateScrollY(osc(() => v.noiseFreq * 0.5))
+    .repeat()
+    .out(o0);
+
+  // o1: Mid-frequency scrolling geometry
+  shape(2, 0.1, 0)
+    .repeatY(10)
+    .scrollY(0.01, () => v.scrollDist * 0.005)
+    .modulateScrollY(osc(() => v.modulateAmount * 0.01))
+    .out(o1);
+
+  // o2: Self-referencing feedback-like chain
+  shape(4, 0.7, 0)
+    .modulateRepeatX(
+      osc(2000, () => v.repeatY),
+      ({time}) => Math.sin(time) * 100,
+      100
+    )
+    .blend(src(o2))
+    .invert(() => v.inv)
+    .modulateRepeatY(osc(() => v.scrollSpeed * 0.005), 1, 1)
+    .out(o2);
+
+  // o3: Phase-locked triple blend (the "musical" composite)
+  shape(0.1, 0.001, 0.01)
+    .blend(src(o2), () => v.blend2 * v.dimFactor * 0.5)
+    .blend(src(o1), ({time}) => {
+      const s = Math.sin(time * 0.5);
+      return s * 0.4 * v.dimFactor;
+    })
+    .blend(src(o0), ({time}) => {
+      const s = Math.sin(time * 0.5);
+      return s === 0 ? 0 : (1 / s) * 0.1 * v.dimFactor;
+    })
+    .brightness(() => (v.dimFactor - 1) * 0.3 + v.brightness)
+    .out(o3);
+
+  render(o3);
+}
+
+// ============================================================
+// PATCH MANAGER
+// ============================================================
+const patches = { 1: buildPatch1, 2: buildPatch2, 3: buildPatch3 };
+const patchNames = { 1: 'Grid Stutter', 2: 'Recursive Stencil', 3: 'Frequency Shimmer' };
+let currentPatch = 1;
+
+function switchPatch(n) {
+  if (!patches[n]) return;
+  currentPatch = n;
+  patches[n]();
+  document.getElementById('patch-name').textContent =
+    `PATCH ${n}: ${patchNames[n].toUpperCase()}`;
+}
+
+// ============================================================
+// AUDIO SOURCE TOGGLE
+// ============================================================
+let audioMode = 'mic';
+let audioElement = null;
+let fileSourceCreated = false;
+
+function toggleAudioSource() {
+  if (audioMode === 'mic') {
+    document.getElementById('file-input').click();
+  } else {
+    audio.connectMic();
+    audioMode = 'mic';
+    if (audioElement) audioElement.pause();
+    document.getElementById('source-indicator').textContent = 'MIC';
+  }
+}
+
+document.getElementById('file-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  if (!audioElement) {
+    audioElement = new Audio();
+    audioElement.loop = true;
+    audioElement.crossOrigin = 'anonymous';
+  }
+  audioElement.src = URL.createObjectURL(file);
+
+  if (!fileSourceCreated) {
+    await audio.connectFile(audioElement);
+    fileSourceCreated = true;
+  } else {
+    // Source already connected — just play new file
+    if (audio.ctx.state === 'suspended') await audio.ctx.resume();
+  }
+
+  audioElement.play();
+  audioMode = 'file';
+  document.getElementById('source-indicator').textContent = 'FILE: ' + file.name;
+});
+
+// ============================================================
+// KEYBOARD HANDLER
+// ============================================================
+let controlsVisible = false;
+
+document.addEventListener('keydown', (e) => {
+  switch (e.key) {
+    case '1': switchPatch(1); break;
+    case '2': switchPatch(2); break;
+    case '3': switchPatch(3); break;
+    case 'm': case 'M': toggleAudioSource(); break;
+    case 'Tab':
+      e.preventDefault();
+      controlsVisible = !controlsVisible;
+      document.getElementById('controls').classList.toggle('visible', controlsVisible);
+      break;
+  }
+});
+
+// ============================================================
+// INIT
+// ============================================================
+const audio = new AudioEngine();
+const mapper = new AudioMapper(audio);
+
+const hydra = new Hydra({
+  detectAudio: false,
+  enableStreamCapture: false,
+});
+
+// Build Patch 1 immediately (visuals run without audio)
+switchPatch(1);
+
+// Show controls + "click to start" prompt
+document.getElementById('controls').classList.add('visible');
+controlsVisible = true;
+
+// Defer audio init to first user gesture (browser autoplay policy)
+let audioStarted = false;
+async function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  await audio.connectMic();
+  document.getElementById('source-indicator').textContent = 'MIC';
+  // Hide controls after audio starts
+  setTimeout(() => {
+    document.getElementById('controls').classList.remove('visible');
+    controlsVisible = false;
+  }, 1500);
+}
+
+document.addEventListener('click', startAudio, { once: false });
+document.addEventListener('keydown', startAudio, { once: false });
+
+// Update loop
+function updateLoop() {
+  audio.update();
+  mapper.update(currentPatch);
+
+  // Energy meter
+  const w = Math.min(100, audio.smoothedEnergy * 200);
+  document.getElementById('meter').style.width = w + '%';
+
+  requestAnimationFrame(updateLoop);
+}
+requestAnimationFrame(updateLoop);
+</script>
+</body>
+</html>
